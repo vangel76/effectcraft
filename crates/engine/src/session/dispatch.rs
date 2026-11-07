@@ -20,6 +20,11 @@ impl Session {
         }
         // Last-resort guard: a panicking command reports an error instead of crashing the app.
         let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        // A dry run only reports what the command would do: it neither completes a tutorial
+        // step nor goes into the journal (a prompt's probe, then Cancel, leaves no trace).
+        if params.get("dryRun") == Some(&Value::Bool(true)) {
+            return Ok(r);
+        }
         self.learn_observe(id, &params);
         if spec.journal {
             self.journal.push((id.to_string(), params));

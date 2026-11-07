@@ -315,7 +315,23 @@ pub(super) fn precompose(s: &mut Session, p: &Value) -> Result<Value> {
 /// nested composition (Position/Anchor Point, timing); anything the layer itself adds to the look,
 /// and what only holds inside the nested comp, is listed. These are warnings: `force` unpacks
 /// anyway and drops it. A lock is not listed here: it always refuses.
-fn unprecompose_warnings(comp: &effectcraft_project::Comp, layer: &Layer, nested: &effectcraft_project::Comp) -> Vec<String> {
+fn unprecompose_warnings(
+    s: &Session,
+    comp: &effectcraft_project::Comp,
+    layer: &Layer,
+    item: effectcraft_project::ItemId,
+    nested: &effectcraft_project::Comp,
+) -> Vec<String> {
+    let mut why = own_warnings(comp, layer, nested);
+    why.extend(switch_warnings(layer, nested, s.prefs.general.switches_affect_nested_comps));
+    why.extend(sampling_warnings(comp, nested));
+    why.extend(position_expression_warnings(layer, nested));
+    why.extend(frame_warnings(&s.project, item, comp, layer, nested));
+    why
+}
+
+/// [`unprecompose_warnings`] about the pre-comp layer, its links and the nested comp's layers.
+fn own_warnings(comp: &effectcraft_project::Comp, layer: &Layer, nested: &effectcraft_project::Comp) -> Vec<String> {
     let mut why = vec![];
     if layer.parent.is_some() {
         why.push("the layer has a parent".to_string());
@@ -384,24 +400,143 @@ fn unprecompose_warnings(comp: &effectcraft_project::Comp, layer: &Layer, nested
     if nested.layers.iter().any(|l| l.switches.solo) {
         why.push("the composition has a soloed layer".to_string());
     }
-    why.extend(sampling_warnings(comp, nested));
-    why.extend(position_expression_warnings(layer, nested));
+    why
+}
+
+/// The pre-comp layer's own switches and Audio Levels, which the expanded layers don't take over:
+/// Quality and Sampling resample the nested picture (Quality also passes down with Switches
+/// Affect Nested Comps), Frame Blending blends the nested comp's frames, a Motion Blur switch that
+/// is off keeps the nested layers from blurring (with Switches Affect Nested Comps), and Audio
+/// Levels set the level of the nested mix.
+fn switch_warnings(layer: &Layer, nested: &effectcraft_project::Comp, nested_switches: bool) -> Vec<String> {
+    use effectcraft_project::{FrameBlend, Quality, Sampling};
+    let sw = &layer.switches;
+    let mut why = vec![];
+    if sw.quality != Quality::Best || sw.sampling != Sampling::Bilinear {
+        why.push("the layer's Quality or Sampling switch is not at its default".to_string());
+    }
+    if sw.frame_blend != FrameBlend::Off {
+        why.push("the layer's Frame Blending switch is on".to_string());
+    }
+    if nested_switches && !sw.motion_blur && nested.layers.iter().any(|l| l.switches.motion_blur) {
+        why.push("the layer's Motion Blur switch is off, which keeps the composition's motion-blurred layers from blurring".to_string());
+    }
+    if let Some(levels) = layer.props.sub("audio").and_then(|g| g.get("levels"))
+        && (levels.is_animated() || levels.has_expression() || levels.value.as_vec2() != [0.0, 0.0])
+    {
+        why.push("the layer's Audio Levels are changed, animated or have an expression".to_string());
+    }
     why
 }
 
 /// What the nested comp's own frame sampling does that the expanded layers lose: a preserved
-/// frame rate other than the parent's (its layers then change only on its own frames), and
-/// motion blur with a shutter other than the parent's.
+/// frame rate other than the parent's (its layers then change only on its own frames), motion
+/// blur settings other than the parent's (shutter, samples, Enable Motion Blur) and another
+/// Enable Frame Blending, each only when a nested layer uses it.
 fn sampling_warnings(comp: &effectcraft_project::Comp, nested: &effectcraft_project::Comp) -> Vec<String> {
     let mut why = vec![];
     if nested.preserve_frame_rate && nested.frame_rate != comp.frame_rate {
         why.push("the composition preserves a frame rate other than this one's (its layers would be sampled at this comp's frames)".to_string());
     }
-    let shutter = nested.shutter_angle != comp.shutter_angle || nested.shutter_phase != comp.shutter_phase;
-    if shutter && nested.layers.iter().any(|l| l.switches.motion_blur) {
-        why.push("the composition's motion blur shutter differs from this one's".to_string());
+    let blur = nested.shutter_angle != comp.shutter_angle
+        || nested.shutter_phase != comp.shutter_phase
+        || nested.enable_motion_blur != comp.enable_motion_blur
+        || nested.motion_blur_samples != comp.motion_blur_samples
+        || nested.motion_blur_adaptive_limit != comp.motion_blur_adaptive_limit;
+    if blur && nested.layers.iter().any(|l| l.switches.motion_blur) {
+        why.push("the composition's motion blur settings (shutter, samples or Enable Motion Blur) differ from this one's".to_string());
+    }
+    let blend = nested.enable_frame_blending != comp.enable_frame_blending;
+    if blend && nested.layers.iter().any(|l| l.switches.frame_blend != effectcraft_project::FrameBlend::Off) {
+        why.push("the composition's Enable Frame Blending differs from this one's".to_string());
     }
     why
+}
+
+/// At most this many frames per nested layer are looked at by [`frame_warnings`].
+const FRAME_SAMPLES: i64 = 600;
+
+/// Nested layers that draw outside the nested comp's frame where this comp shows them: the frame
+/// clipped them, the expanded copies are not clipped. Nothing can show when the nested frame,
+/// placed by the pre-comp layer's move, covers this comp's frame. Otherwise each nested layer's
+/// bounds are taken at the nested comp's frames within the span the pre-comp layer showed (at
+/// most [`FRAME_SAMPLES`] of them, spread evenly); a layer with effects or layer styles may draw
+/// anywhere.
+fn frame_warnings(
+    project: &effectcraft_project::Project,
+    item: effectcraft_project::ItemId,
+    comp: &effectcraft_project::Comp,
+    layer: &Layer,
+    nested: &effectcraft_project::Comp,
+) -> Vec<String> {
+    let (dx, dy) = placement_offset(layer);
+    let (w, h) = (f64::from(comp.width), f64::from(comp.height));
+    let (nw, nh) = (f64::from(nested.width), f64::from(nested.height));
+    if dx <= 0.0 && dy <= 0.0 && dx + nw >= w && dy + nh >= h {
+        return vec![];
+    }
+    // This comp's frame in nested coordinates; what of `b` lies in it but outside the nested frame.
+    let view = [-dx, -dy, w - dx, h - dy];
+    let exposed = |b: [f64; 4]| {
+        if !b.iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        let c = [b[0].max(view[0]), b[1].max(view[1]), b[2].min(view[2]), b[3].min(view[3])];
+        const EPS: f64 = 1e-6;
+        c[0] < c[2] && c[1] < c[3] && (c[0] < -EPS || c[1] < -EPS || c[2] > nw + EPS || c[3] > nh + EPS)
+    };
+    let shown = (layer.in_point.max(layer.start_time) - layer.start_time, layer.out_point.min(layer.start_time + nested.duration) - layer.start_time);
+    nested
+        .layers
+        .iter()
+        .filter(|l| l.source.is_av() && l.switches.video && !l.switches.guide)
+        .filter(|l| outside_frame(project, item, nested, l, shown, &exposed))
+        .map(|l| format!("layer “{}” draws outside the composition's frame, which no longer clips it", l.name))
+        .collect()
+}
+
+/// Whether nested layer `l` has bounds that `exposed` flags at a sampled frame within `shown`
+/// (nested comp time), or effects or layer styles that may draw anywhere.
+fn outside_frame(
+    project: &effectcraft_project::Project,
+    item: effectcraft_project::ItemId,
+    nested: &effectcraft_project::Comp,
+    l: &Layer,
+    shown: (Tick, Tick),
+    exposed: &dyn Fn([f64; 4]) -> bool,
+) -> bool {
+    let (lo, hi) = (shown.0.max(l.in_point), shown.1.min(l.out_point));
+    if lo >= hi {
+        return false;
+    }
+    if l.effects().is_some_and(|e| !e.children.is_empty()) || l.styles_change_pixels() {
+        return true;
+    }
+    let rate = nested.frame_rate;
+    let (f0, f1) = (rate.frame_at(lo), rate.frame_at(hi));
+    let step = (f1.saturating_sub(f0) / FRAME_SAMPLES).max(1);
+    let mut f = f0;
+    while f <= f1 {
+        let t = rate.tick_of(f).max(lo).min(hi);
+        let ctx = effectcraft_render::EvalCtx::new(project, item, nested, t);
+        if let Some(b) = effectcraft_render::content_bounds(&ctx, l) {
+            let m = ctx.layer_to_comp(l).0;
+            let pts = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]].map(|p| m.apply(effectcraft_geom::vec2(p[0], p[1])));
+            let x = pts.iter().map(|p| p.x);
+            let y = pts.iter().map(|p| p.y);
+            let bb = [
+                x.clone().fold(f64::INFINITY, f64::min),
+                y.clone().fold(f64::INFINITY, f64::min),
+                x.fold(f64::NEG_INFINITY, f64::max),
+                y.fold(f64::NEG_INFINITY, f64::max),
+            ];
+            if exposed(bb) {
+                return true;
+            }
+        }
+        f = f.saturating_add(step);
+    }
+    false
 }
 
 /// The move from the pre-comp layer's Position against its Anchor Point, which expansion adds to
@@ -542,14 +677,16 @@ fn remap_layer_values(props: &mut effectcraft_project::PropGroup, map: &[(LayerI
 /// with their keyframes, effects, masks, parenting, mattes, markers and audio; their timing is
 /// moved by the pre-comp layer's Start and trimmed to the span it showed, and an Anchor Point
 /// different from Position moves the unparented ones by the difference. The nested comp stays in
-/// the project. The nested comp's frame no longer clips what the layers draw outside it.
+/// the project. The nested comp's frame no longer clips what the layers draw outside it (a
+/// warning when that would show in this comp).
 ///
 /// A locked pre-comp layer is refused, changing nothing. Anything else that would change the
 /// picture or drop something (see [`unprecompose_warnings`]) is an error listing the reasons unless
 /// `force` is set; with `force` the layer is expanded the same way, what the pre-comp layer itself
 /// carried (effects, masks, styles, transform beyond Position, time remap, blending mode, switches,
 /// parent, matte) goes with it, and the other layers' parent, matte and property links to it are
-/// removed. The result lists the reasons as `warnings`; `dryRun` only lists them.
+/// removed. The result lists the reasons as `warnings`; `dryRun` only lists them, with the
+/// resolved `comp` and `layer`.
 pub(super) fn unprecompose(s: &mut Session, p: &Value) -> Result<Value> {
     let c = "layer.unprecompose";
     let (cid, ids) = layers_p(s, p)?;
@@ -561,9 +698,10 @@ pub(super) fn unprecompose(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(c, format!("can't un-precompose “{}”: the layer is locked (unlock it first)", layer.name)));
     }
     let nested = s.project.comp(item).ok_or_else(|| bad(c, "the layer's composition is missing"))?.clone();
-    let warnings = unprecompose_warnings(&comp, &layer, &nested);
+    let warnings = unprecompose_warnings(s, &comp, &layer, item, &nested);
     if b_p(p, "dryRun").unwrap_or(false) {
-        return Ok(json!({"dryRun": true, "warnings": warnings}));
+        // The resolved target, for a caller that asks first and unpacks this layer later.
+        return Ok(json!({"dryRun": true, "warnings": warnings, "comp": cid.0, "layer": lid.0}));
     }
     if !warnings.is_empty() && !b_p(p, "force").unwrap_or(false) {
         let why = warnings.join("; ");

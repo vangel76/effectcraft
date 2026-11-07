@@ -266,20 +266,26 @@ build real projects through these interfaces; they are worked examples of everyt
   effects, masks, parenting, mattes, markers kept; timing moved by the layer's Start and trimmed to
   what it showed; Position minus Anchor Point added to the unparented ones). One undo step; the
   nested comp stays in the project; the nested comp's frame no longer clips what its layers draw
-  outside it. Only a **locked** pre-comp layer is refused (with or without `force`), changing
+  outside it (a warning when that would show). Only a **locked** pre-comp layer is refused (with or without `force`), changing
   nothing. Everything that would change the picture or drop something is a warning: the pre-comp
   layer has a parent or matte, effects, masks, layer styles, a non-default Scale / Rotation /
   Opacity, an animated transform, time remap or stretch, a blending mode, Video or Audio off, Solo
-  or Guide on, the 3D / collapse / adjustment switch or Preserve Transparency, or is used by another
+  or Guide on, the 3D / collapse / adjustment switch or Preserve Transparency, a Quality other than
+  Best or Sampling other than Bilinear, Frame Blending on, Motion Blur off while nested layers use
+  motion blur (Switches Affect Nested Comps), changed, animated or expression-driven Audio Levels,
+  or is used by another
   layer (parent, matte or a layer property), or an expression of another layer names it (by name in
   quotes or as `layer(<index>)`; listed per property, the expression is left as written and will
   no longer find it); or the nested comp holds a camera, light, adjustment,
   3D, collapsing or soloed layer, or a layer with a blending mode or Preserve Transparency, preserves
-  a frame rate other than the comp's, has a motion-blur shutter other than the comp's (with motion
-  blur layers), or has an unparented layer with a Position expression while the pre-comp layer's
-  Position differs from its Anchor Point (the move is added to stored values only). Without
+  a frame rate other than the comp's, has motion-blur settings (shutter, samples, Enable Motion
+  Blur) other than the comp's (with motion blur layers) or another Enable Frame Blending (with
+  frame-blended layers), has an unparented layer with a Position expression while the pre-comp
+  layer's Position differs from its Anchor Point (the move is added to stored values only), or
+  has a layer that draws outside its frame where the comp shows it (bounds sampled at up to 600
+  frames; a layer with effects or styles counts as drawing outside). Without
   `force` such a call is an error listing every reason and nothing changes; `dryRun: true` returns
-  `{dryRun, warnings}` without changing anything. With `force: true` it unpacks anyway and returns
+  `{dryRun, warnings, comp, layer}` without changing anything (and is not journaled). With `force: true` it unpacks anyway and returns
   `{layers, warnings}`: what the pre-comp layer itself carried (effects, masks, styles, transform
   beyond Position, time remap, blending mode, switches, its parent and matte) is dropped, and other
   layers' parent, track matte and layer-property links to it are removed. The menu shows the

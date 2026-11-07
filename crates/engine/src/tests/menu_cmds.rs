@@ -2134,7 +2134,10 @@ fn unprecompose_carries_the_precomp_layers_position_and_start() {
     let (a, b) = (id_named(&s, "A"), id_named(&s, "B"));
     let pre = s.execute("layer.precompose", json!({"layers": [a, b], "name": "Inner"})).unwrap()["layer"].as_u64().unwrap();
     s.execute("prop.set", json!({"layer": pre, "path": "transform/position", "value": [360, 160]})).unwrap();
-    s.execute("layer.unprecompose", json!({"layers": [pre]})).unwrap();
+    // B, carried down with A to y = 370 at 1 s, ran past the nested frame (360 high); moved up by
+    // 20 that strip would show in this comp: a warning, unpacked anyway.
+    let r = s.execute("layer.unprecompose", json!({"layers": [pre], "force": true})).unwrap();
+    assert_eq!(r["warnings"], json!(["layer “B” draws outside the composition's frame, which no longer clips it"]));
     // The pre-comp's Anchor Point sat at the comp centre (320, 180): everything moved by (+40, −20).
     let after = scene_look(&mut s);
     for (i, (w, g)) in before.iter().zip(after).enumerate() {
@@ -2427,7 +2430,108 @@ fn unprecompose_warns_when_the_nested_comp_preserves_another_frame_rate() {
     let a = id_named(&s, "A");
     s.execute("layer.setSwitch", json!({"layers": [a], "switch": "motionBlur", "value": true})).unwrap();
     s.execute("comp.open", json!({"comp": outer.0})).unwrap();
-    warned_then_forced(&mut s, pre, "motion blur shutter");
+    warned_then_forced(&mut s, pre, "motion blur settings");
+
+    // The renderer also takes the samples and Enable Motion Blur from the comp it draws.
+    for (command, params) in [("comp.settings", json!({"motionBlurSamples": 4})), ("comp.setSwitch", json!({"switch": "motionBlur", "value": false}))] {
+        let (mut s, outer, inner, pre) = unprecompose_scene();
+        let mut params = params;
+        params["comp"] = json!(inner);
+        s.execute(command, params).unwrap();
+        s.execute("comp.open", json!({"comp": inner})).unwrap();
+        let a = id_named(&s, "A");
+        s.execute("layer.setSwitch", json!({"layers": [a], "switch": "motionBlur", "value": true})).unwrap();
+        s.execute("comp.open", json!({"comp": outer.0})).unwrap();
+        s.execute("layer.setSwitch", json!({"layers": [pre], "switch": "motionBlur", "value": true})).unwrap();
+        warned_then_forced(&mut s, pre, "motion blur settings");
+    }
+}
+
+/// The pre-comp layer's own Quality, Sampling, Frame Blending and Audio Levels, and a Motion Blur
+/// switch that is off over motion-blurred nested layers (Switches Affect Nested Comps), are lost
+/// on expansion: warnings. The defaults are none.
+#[test]
+fn unprecompose_warns_about_the_precomp_layers_switches_and_audio_levels() {
+    for (switch, value, what) in [("quality", false, "Quality or Sampling"), ("frameBlend", true, "Frame Blending switch")] {
+        let (mut s, _, _, pre) = unprecompose_scene();
+        s.execute("layer.setSwitch", json!({"layers": [pre], "switch": switch, "value": value})).unwrap();
+        warned_then_forced(&mut s, pre, what);
+    }
+    let (mut s, outer, _, pre) = unprecompose_scene();
+    let proj = std::sync::Arc::make_mut(&mut s.project);
+    proj.comp_mut(outer).unwrap().layer_mut(effectcraft_project::LayerId(pre)).unwrap().switches.sampling = effectcraft_project::Sampling::Bicubic;
+    warned_then_forced(&mut s, pre, "Quality or Sampling");
+    let (mut s, _, _, pre) = unprecompose_scene();
+    s.execute("prop.set", json!({"layer": pre, "path": "audio/levels", "value": [-6, -6]})).unwrap();
+    warned_then_forced(&mut s, pre, "Audio Levels");
+    let (mut s, _, _, pre) = unprecompose_scene();
+    s.execute("prop.setExpression", json!({"layer": pre, "path": "audio/levels", "expression": "[0, 0]"})).unwrap();
+    warned_then_forced(&mut s, pre, "Audio Levels");
+
+    let (mut s, outer, inner, pre) = unprecompose_scene();
+    s.execute("comp.open", json!({"comp": inner})).unwrap();
+    let a = id_named(&s, "A");
+    s.execute("layer.setSwitch", json!({"layers": [a], "switch": "motionBlur", "value": true})).unwrap();
+    s.execute("comp.open", json!({"comp": outer.0})).unwrap();
+    let dry = |s: &mut Session| s.execute("layer.unprecompose", json!({"layers": [pre], "dryRun": true})).unwrap()["warnings"].clone();
+    assert!(dry(&mut s).to_string().contains("Motion Blur switch is off"), "{}", dry(&mut s));
+    s.prefs.general.switches_affect_nested_comps = false;
+    assert_eq!(dry(&mut s), json!([]), "without Switches Affect Nested Comps the nested layers blur anyway");
+    s.prefs.general.switches_affect_nested_comps = true;
+    s.execute("layer.setSwitch", json!({"layers": [pre], "switch": "motionBlur", "value": true})).unwrap();
+    assert_eq!(dry(&mut s), json!([]), "the pre-comp layer lets them blur");
+}
+
+/// The nested comp's frame clipped its layers; expanded, they are not clipped. A warning when a
+/// nested layer draws outside that frame where this comp shows it; none when the part outside
+/// lies beyond this comp's frame too, or when the nested frame covers this comp's frame.
+#[test]
+fn unprecompose_warns_when_nested_layers_draw_outside_its_frame() {
+    // C alone (200 × 100 at (500, 100)) in a nested comp the size of this one.
+    let scene = |pre_x: f64, c_x: f64| {
+        let mut s = precomp_scene();
+        let c = id_named(&s, "C");
+        let outer = s.active_comp_id().unwrap();
+        let r = s.execute("layer.precompose", json!({"layers": [c], "name": "Inner"})).unwrap();
+        let (inner, pre) = (r["comp"].as_u64().unwrap(), r["layer"].as_u64().unwrap());
+        s.execute("comp.open", json!({"comp": inner})).unwrap();
+        let c = id_named(&s, "C");
+        s.execute("prop.set", json!({"layer": c, "path": "transform/position", "value": [c_x, 100]})).unwrap();
+        s.execute("comp.open", json!({"comp": outer.0})).unwrap();
+        s.execute("prop.set", json!({"layer": pre, "path": "transform/position", "value": [pre_x, 180]})).unwrap();
+        (s, pre)
+    };
+    let warnings = |s: &mut Session, pre: u64| s.execute("layer.unprecompose", json!({"layers": [pre], "dryRun": true})).unwrap()["warnings"].clone();
+    // Inside the nested frame, wherever the pre-comp layer moves it: nothing to warn about.
+    let (mut s, pre) = scene(220.0, 500.0);
+    assert_eq!(warnings(&mut s, pre), json!([]));
+    // C reaches x = 750 in the nested comp, 110 px past its frame. Moved right by 100 that part lies
+    // past this comp's right edge as well: still nothing shows.
+    let (mut s, pre) = scene(420.0, 650.0);
+    assert_eq!(warnings(&mut s, pre), json!([]));
+    // Moved left by 100, the part 640..750 lands at 540..650, inside this comp: it would show.
+    let (mut s, pre) = scene(220.0, 650.0);
+    let what = "layer “C” draws outside the composition's frame, which no longer clips it";
+    assert_eq!(warnings(&mut s, pre), json!([what]));
+    assert!(s.execute("layer.unprecompose", json!({"layers": [pre]})).unwrap_err().to_string().contains(what));
+    let r = s.execute("layer.unprecompose", json!({"layers": [pre], "force": true})).unwrap();
+    assert_eq!(r["warnings"], json!([what]));
+    // Unpacked, C is no longer clipped: it reaches past x = 540, where the nested frame ended.
+    assert!(seen_bounds(&s, id_named(&s, "C"))[2] > 640.0 - 100.0 + 1.0);
+}
+
+/// A dry run (the menu's question before it unpacks) is neither journaled nor counted as the
+/// command; the unpack itself is journaled.
+#[test]
+fn unprecompose_dry_run_is_not_journaled() {
+    let (mut s, outer, _, pre) = unprecompose_scene();
+    let journal = s.journal.len();
+    let dry = s.execute("layer.unprecompose", json!({"layers": [pre], "dryRun": true})).unwrap();
+    assert_eq!((dry["comp"].as_u64(), dry["layer"].as_u64()), (Some(outer.0), Some(pre)), "the dry run names its target: {dry}");
+    assert_eq!(s.journal.len(), journal, "the dry run is not journaled");
+    s.execute("layer.unprecompose", json!({"layers": [pre]})).unwrap();
+    assert_eq!(s.journal.len(), journal + 1);
+    assert_eq!(s.journal.last().map(|j| j.0.as_str()), Some("layer.unprecompose"));
 }
 
 /// The pre-comp layer's move (Position against Anchor Point) is added to the stored Position of

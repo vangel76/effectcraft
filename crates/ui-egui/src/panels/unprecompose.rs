@@ -36,14 +36,13 @@ pub fn guard(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool,
     if warnings.is_empty() {
         return Ok(false);
     }
-    // The layer the warnings are about, whatever is selected by the time the prompt is answered.
+    // The layer the warnings are about, by the ids the dry run resolved, whatever is selected,
+    // reordered or renamed by the time the prompt is answered.
+    let (Some(comp), Some(layer)) = (r["comp"].as_u64(), r["layer"].as_u64()) else { return Ok(false) };
     let mut pinned = params.as_object().cloned().unwrap_or_default();
-    if !pinned.contains_key("layer") && !pinned.contains_key("layers") {
-        pinned.insert("layers".into(), json!(app.session.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>()));
-    }
-    if let Some(comp) = app.session.active_comp_id().filter(|_| !pinned.contains_key("comp")) {
-        pinned.insert("comp".into(), json!(comp.0));
-    }
+    pinned.remove("layer");
+    pinned.insert("layers".into(), json!([layer]));
+    pinned.insert("comp".into(), json!(comp));
     app.dialog_state.unprecompose.command = Some((Value::Object(pinned), warnings));
     app.dialog = Some(Dialog::Unprecompose);
     Ok(true)
@@ -92,10 +91,23 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
 fn finish(app: &mut EffectcraftApp, ctx: &egui::Context, go: bool) {
     app.dialog = None;
     let Some((params, _)) = app.dialog_state.unprecompose.command.take() else { return };
-    if go {
-        // An error is already in the status bar.
-        let _ = crate::menus::run_engine(app, ctx, COMMAND, forced(&params));
+    if !go {
+        return;
     }
+    // A layer id that is gone would be read as a layer number: unpack only the layer warned about.
+    if !still_there(&app.session, &params) {
+        app.ui.status = tr("The pre-comp layer is no longer there; nothing was unpacked.").to_string();
+        return;
+    }
+    // An error is already in the status bar.
+    let _ = crate::menus::run_engine(app, ctx, COMMAND, forced(&params));
+}
+
+/// Whether the pinned comp still holds the pinned layer (by id).
+fn still_there(s: &effectcraft_engine::Session, params: &Value) -> bool {
+    let comp = params["comp"].as_u64().map(effectcraft_project::ItemId);
+    let layer = params["layers"].get(0).and_then(Value::as_u64).map(effectcraft_project::LayerId);
+    comp.zip(layer).is_some_and(|(c, l)| s.project.comp(c).is_some_and(|c| c.layer(l).is_some()))
 }
 
 /// `params` with the user's consent to the reasons the prompt listed.
@@ -154,6 +166,86 @@ mod tests {
         finish(&mut app, &ctx, true);
         assert!(app.dialog.is_none());
         assert_eq!(layer_count(&app.session), 2, "the two solids are back");
+    }
+
+    /// A window-sized frame's input with `events`.
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1280.0, 860.0))), events, ..Default::default() }
+    }
+
+    /// Draw a frame with the open dialog.
+    fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
+        ctx.run_ui(input(vec![]), |ui| {
+            app.auto.begin_frame();
+            crate::panels::dialogs::show(app, ui.ctx());
+        })
+        .textures_delta
+        .clear();
+    }
+
+    /// Click the widget registered as `id`, then draw the frames that follow.
+    fn click(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) {
+        // The prompt settles (sized, then centred) before it is clicked.
+        for _ in 0..4 {
+            frame(app, ctx);
+        }
+        let [x, y, w, h] = app.auto.find(id).unwrap_or_else(|| panic!("{id} is not on screen")).rect;
+        let pos = egui::pos2(x + w / 2.0, y + h / 2.0);
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        for event in [egui::Event::PointerMoved(pos), button(true), button(false)] {
+            ctx.run_ui(input(vec![event]), |ui| {
+                app.auto.begin_frame();
+                crate::panels::dialogs::show(app, ui.ctx());
+            })
+            .textures_delta
+            .clear();
+        }
+        frame(app, ctx);
+    }
+
+    /// The prompt's buttons, clicked: Cancel keeps the pre-comp layer, Unpack Anyway unpacks it.
+    /// The question itself (the dry run) leaves no journal entry; the unpack leaves one.
+    #[test]
+    fn the_prompts_buttons_cancel_and_unpack_and_asking_is_not_journaled() {
+        let (ctx, mut app) = fresh();
+        let pre = scene(&mut app);
+        app.session.execute("prop.set", json!({"layer": pre, "path": "transform/opacity", "value": 50})).unwrap();
+        let journal = app.session.journal.len();
+        crate::menus::invoke(&mut app, &ctx, COMMAND, json!({"layers": [pre]})).unwrap();
+        assert_eq!(app.session.journal.len(), journal, "asking is not journaled");
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        click(&mut app, &ctx, "dialog.unprecompose.cancel");
+        assert!(app.dialog.is_none() && app.dialog_state.unprecompose.command.is_none());
+        assert_eq!(layer_count(&app.session), 1, "Cancel left the pre-comp layer");
+        assert_eq!(app.session.journal.len(), journal, "Cancel leaves no trace in the journal");
+        crate::menus::invoke(&mut app, &ctx, COMMAND, json!({"layers": [pre]})).unwrap();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        click(&mut app, &ctx, "dialog.unprecompose.force");
+        assert!(app.dialog.is_none());
+        assert_eq!(layer_count(&app.session), 2, "Unpack Anyway brought the two solids back");
+        assert_eq!(app.session.journal.last().map(|j| j.0.as_str()), Some(COMMAND));
+        assert_eq!(app.session.journal.len(), journal + 1);
+    }
+
+    /// The prompt unpacks the layer it warned about, by id: named by its number it stays that
+    /// layer when the order changes, and once it is gone Unpack Anyway unpacks nothing.
+    #[test]
+    fn unpack_anyway_keeps_to_the_layer_it_warned_about() {
+        let (ctx, mut app) = fresh();
+        let pre = scene(&mut app);
+        app.session.execute("prop.set", json!({"layer": pre, "path": "transform/opacity", "value": 50})).unwrap();
+        crate::menus::invoke(&mut app, &ctx, COMMAND, json!({"layer": "#1"})).unwrap();
+        let (params, _) = app.dialog_state.unprecompose.command.clone().unwrap();
+        assert_eq!(params["layers"], json!([pre]), "{params}");
+        assert!(params.get("layer").is_none(), "{params}");
+        app.session.execute("edit.clear", json!({"layers": [pre]})).unwrap();
+        let before = app.session.project.clone();
+        finish(&mut app, &ctx, true);
+        assert!(app.dialog.is_none());
+        assert!(app.ui.status.contains("no longer there"), "{}", app.ui.status);
+        assert!(std::sync::Arc::ptr_eq(&app.session.project, &before), "nothing else was unpacked");
     }
 
     #[test]
